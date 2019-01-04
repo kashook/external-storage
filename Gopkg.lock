@@ -366,18 +366,21 @@
   version = "v1.1.5"
 
 [[projects]]
-  digest = "1:259c981611ec8c76e54c7289fbe3475137dcc1741fda3e22b9ac4f9814790944"
+  branch = "ability-to-reclaim-gids"
+  digest = "1:10f0db0099cf9d053a5d9c216b857bcb52a78b27d143616c593d4356b883e901"
   name = "github.com/kubernetes-sigs/sig-storage-lib-external-provisioner"
   packages = [
     "allocator",
     "controller",
     "controller/metrics",
     "gidallocator",
+    "gidreclaimer",
     "mount",
     "util",
   ]
   pruneopts = "UT"
-  revision = "712c5819bca548e64c5fb29d2946c5d69126c3fa"
+  revision = "bed696a522fe73bb5761c29c969c784fbf131468"
+  source = "https://github.com/kashook/sig-storage-lib-external-provisioner.git"
 
 [[projects]]
   digest = "1:933c3a3ae62b901b7dc4430113b5303eb69a496a98b1b70771942b272dd94bdf"
@@ -1254,12 +1257,13 @@
     "github.com/guelfey/go.dbus",
     "github.com/heketi/heketi/client/api/go-client",
     "github.com/heketi/heketi/pkg/glusterfs/api",
+    "github.com/kubernetes-sigs/sig-storage-lib-external-provisioner/allocator",
     "github.com/kubernetes-sigs/sig-storage-lib-external-provisioner/controller",
     "github.com/kubernetes-sigs/sig-storage-lib-external-provisioner/gidallocator",
+    "github.com/kubernetes-sigs/sig-storage-lib-external-provisioner/gidreclaimer",
     "github.com/kubernetes-sigs/sig-storage-lib-external-provisioner/mount",
     "github.com/kubernetes-sigs/sig-storage-lib-external-provisioner/util",
     "github.com/magiconair/properties",
-    "github.com/miekg/dns",
     "github.com/mitchellh/mapstructure",
     "github.com/pborman/uuid",
     "github.com/powerman/rpc-codec/jsonrpc2",
@@ -1273,7 +1277,6 @@
     "golang.org/x/oauth2",
     "golang.org/x/oauth2/google",
     "golang.org/x/sys/unix",
-    "golang.org/x/time/rate",
     "google.golang.org/api/compute/v1",
     "google.golang.org/api/container/v1",
     "google.golang.org/api/googleapi",
@@ -1282,7 +1285,6 @@
     "k8s.io/api/batch/v1",
     "k8s.io/api/core/v1",
     "k8s.io/api/storage/v1",
-    "k8s.io/api/storage/v1beta1",
     "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1",
     "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset",
     "k8s.io/apimachinery/pkg/api/errors",
@@ -1301,7 +1303,6 @@
     "k8s.io/apimachinery/pkg/util/uuid",
     "k8s.io/apimachinery/pkg/util/validation",
     "k8s.io/apimachinery/pkg/util/validation/field",
-    "k8s.io/apimachinery/pkg/util/version",
     "k8s.io/apimachinery/pkg/util/wait",
     "k8s.io/client-go/informers",
     "k8s.io/client-go/kubernetes",
@@ -1312,13 +1313,9 @@
     "k8s.io/client-go/listers/storage/v1",
     "k8s.io/client-go/plugin/pkg/client/auth/gcp",
     "k8s.io/client-go/rest",
-    "k8s.io/client-go/testing",
     "k8s.io/client-go/tools/cache",
     "k8s.io/client-go/tools/clientcmd",
-    "k8s.io/client-go/tools/leaderelection",
-    "k8s.io/client-go/tools/leaderelection/resourcelock",
     "k8s.io/client-go/tools/record",
-    "k8s.io/client-go/tools/reference",
     "k8s.io/client-go/tools/remotecommand",
     "k8s.io/client-go/util/cert",
     "k8s.io/client-go/util/flowcontrol",

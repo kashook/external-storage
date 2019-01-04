@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -37,6 +38,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/kubernetes/pkg/apis/core/v1/helper"
 )
 
 const (
@@ -46,11 +49,13 @@ const (
 	dnsNameKey         = "DNS_NAME"
 )
 
+var _ controller.Provisioner = &efsProvisioner{}
+
 type efsProvisioner struct {
+	allocator  gidallocator.Allocator
 	dnsName    string
 	mountpoint string
 	source     string
-	allocator  gidallocator.Allocator
 }
 
 // NewEFSProvisioner creates an AWS EFS volume provisioner
@@ -91,11 +96,13 @@ func NewEFSProvisioner(client kubernetes.Interface) controller.Provisioner {
 		glog.Warningf("couldn't confirm that the EFS file system exists: %v", err)
 	}
 
+	allocator := gidallocator.NewWithGIDReclaimer(client, newFileSystemReclaimer(mountpoint))
+
 	return &efsProvisioner{
 		dnsName:    dnsName,
 		mountpoint: mountpoint,
 		source:     source,
-		allocator:  gidallocator.New(client),
+		allocator:  allocator,
 	}
 }
 
@@ -121,7 +128,16 @@ func getMount(dnsName string) (string, string, error) {
 	return "", "", fmt.Errorf("no mount entry found for %s among entries %s", dnsName, entriesStr)
 }
 
-var _ controller.Provisioner = &efsProvisioner{}
+func reuseVolumesOption(options controller.VolumeOptions) (bool, error) {
+	if reuseStr, ok := options.Parameters["reuseVolumes"]; ok {
+		reuse, err := strconv.ParseBool(options.Parameters["reuseVolumes"])
+		if err != nil {
+			return false, fmt.Errorf("invalid value %s for parameter reuseVolumes: %v", reuseStr, err)
+		}
+		return reuse, nil
+	}
+	return false, nil
+}
 
 // Provision creates a storage asset and returns a PV object representing it.
 func (p *efsProvisioner) Provision(options controller.VolumeOptions) (*v1.PersistentVolume, error) {
@@ -129,39 +145,122 @@ func (p *efsProvisioner) Provision(options controller.VolumeOptions) (*v1.Persis
 		return nil, fmt.Errorf("claim.Spec.Selector is not supported")
 	}
 
-	gidAllocate := true
-	for k, v := range options.Parameters {
-		switch strings.ToLower(k) {
-		case "gidmin":
-		// Let allocator handle
-		case "gidmax":
-		// Let allocator handle
-		case "gidallocate":
-			b, err := strconv.ParseBool(v)
-			if err != nil {
-				return nil, fmt.Errorf("invalid value %s for parameter %s: %v", v, k, err)
-			}
-			gidAllocate = b
-		}
+	volumePath, err := p.getLocalPath(options)
+	if err != nil {
+		glog.Errorf("Failed to provision volume: %v", err)
+		return nil, err
 	}
 
+	glog.Infof("provisioning volume at %s", volumePath)
+
+	volExists := false
+	var existingGid uint32
 	var gid *int
-	if gidAllocate {
-		allocate, err := p.allocator.AllocateNext(options)
+	var reuseVolumes bool
+
+	if reuseVolumes, err = reuseVolumesOption(options); err != nil {
+		glog.Errorf("%v", err)
+		return nil, err
+	}
+
+	if reuseVolumes {
+		volExists, existingGid, err = volumeExists(volumePath) // existingGid is the actual gid on the directory in the file system
 		if err != nil {
 			return nil, err
 		}
-		gid = &allocate
 	}
 
-	err := p.createVolume(p.getLocalPath(options), gid)
-	if err != nil {
-		return nil, err
+	// hook back up to existing directory if we are configured to reuse volumes, the volume exists, and its metadata matches the current PVC and storageclass.
+	if volExists {
+		glog.Infof("%s already exists", volumePath)
+
+		md, err := readVolumeMetadata(volumePath)
+		if err != nil {
+			msg := fmt.Sprintf("failed to read volume metadata for %v: %v", volumePath, err)
+			glog.Error(msg)
+			return nil, errors.New(msg)
+		}
+
+		err = validatePreexistingVolume(options, md, volumePath, existingGid)
+		if err != nil {
+			return nil, err
+		}
+
+		// if a GID was previously allocated and it matches the actual GID on the current directory then use it
+		if md.GID != "" {
+			existingGidInt := int(existingGid)
+			mdGidInt, err := strconv.Atoi(md.GID)
+			if err != nil {
+				msg := fmt.Sprintf("volume metadata contains an invalid GID value: %v", md.GID)
+				glog.Errorf(msg)
+				return nil, errors.New(msg)
+			}
+
+			if existingGidInt == mdGidInt {
+				gid = &existingGidInt
+			} else {
+				msg := fmt.Sprintf("directory %v has a GID of %v, but the volume metadata shows the GID as %v", volumePath, existingGid, md.GID)
+				glog.Error(msg)
+				return nil, errors.New(msg)
+			}
+		}
+
+		glog.Infof("%s was reused since the preexisting volume metadata matches the PVC", volumePath)
+	} else {
+		gidAllocate := true
+		for k, v := range options.Parameters {
+			switch strings.ToLower(k) {
+			case "gidmin":
+				// Let allocator handle
+			case "gidmax":
+				// Let allocator handle
+			case "gidallocate":
+				b, err := strconv.ParseBool(v)
+				if err != nil {
+					return nil, fmt.Errorf("invalid value %s for parameter %s: %v", v, k, err)
+				}
+				gidAllocate = b
+			}
+		}
+
+		if gidAllocate {
+			allocate, err := p.allocator.AllocateNext(options)
+			if err != nil {
+				return nil, err
+			}
+			gid = &allocate
+		}
+
+		err := p.createVolume(volumePath, gid)
+		if err != nil {
+			return nil, err
+		}
+
+		var gidstr string
+		if gid != nil {
+			gidstr = strconv.Itoa(*gid)
+		}
+
+		if reuseVolumes {
+			writeVolumeMetadata(volumePath,
+				volumeMetadata{
+					GID:              gidstr,
+					PVCName:          options.PVC.Name,
+					PVCNamespace:     options.PVC.Namespace,
+					StorageClassName: helper.GetPersistentVolumeClaimClass(options.PVC),
+				})
+		}
 	}
 
 	mountOptions := []string{"vers=4.1"}
 	if options.MountOptions != nil {
 		mountOptions = options.MountOptions
+	}
+
+	remotePath, err := p.getRemotePath(options)
+	if err != nil {
+		glog.Errorf("Failed to get remote path: %v", err)
+		return nil, err
 	}
 
 	pv := &v1.PersistentVolume{
@@ -177,7 +276,7 @@ func (p *efsProvisioner) Provision(options controller.VolumeOptions) (*v1.Persis
 			PersistentVolumeSource: v1.PersistentVolumeSource{
 				NFS: &v1.NFSVolumeSource{
 					Server:   p.dnsName,
-					Path:     p.getRemotePath(options),
+					Path:     remotePath,
 					ReadOnly: false,
 				},
 			},
@@ -185,7 +284,7 @@ func (p *efsProvisioner) Provision(options controller.VolumeOptions) (*v1.Persis
 		},
 	}
 
-	if gidAllocate {
+	if gid != nil {
 		pv.ObjectMeta.Annotations = map[string]string{
 			gidallocator.VolumeGidAnnotationKey: strconv.FormatInt(int64(*gid), 10),
 		}
@@ -222,17 +321,45 @@ func (p *efsProvisioner) createVolume(path string, gid *int) error {
 	return nil
 }
 
-func (p *efsProvisioner) getLocalPath(options controller.VolumeOptions) string {
-	return path.Join(p.mountpoint, p.getDirectoryName(options))
+func (p *efsProvisioner) getLocalPath(options controller.VolumeOptions) (string, error) {
+	dirname, err := p.getDirectoryName(options)
+	if err != nil {
+		return "", err
+	}
+	return path.Join(p.mountpoint, dirname), nil
 }
 
-func (p *efsProvisioner) getRemotePath(options controller.VolumeOptions) string {
+func (p *efsProvisioner) getRemotePath(options controller.VolumeOptions) (string, error) {
+	dirname, err := p.getDirectoryName(options)
+	if err != nil {
+		return "", err
+	}
 	sourcePath := path.Clean(strings.Replace(p.source, p.dnsName+":", "", 1))
-	return path.Join(sourcePath, p.getDirectoryName(options))
+	return path.Join(sourcePath, dirname), nil
 }
 
-func (p *efsProvisioner) getDirectoryName(options controller.VolumeOptions) string {
-	return options.PVC.Name + "-" + options.PVName
+// getDirectoryName determines the name of the directory to create for the PVC.
+// If we are in "reuse volumes" mode, then we generate a predictable name so that
+// the same PVC will always result in the same directory name.  Otherwise, we generate
+// a unique name using the name of the generated PV
+func (p *efsProvisioner) getDirectoryName(options controller.VolumeOptions) (string, error) {
+	reuseVolumes, err := reuseVolumesOption(options)
+	if err != nil {
+		return "", err
+	}
+
+	prefix := ""
+
+	if reuseVolumes {
+		if pfx, ok := options.Parameters["volumePrefix"]; ok && pfx != "" {
+			prefix = pfx + "-"
+		}
+
+		return prefix + options.PVC.Name + "-" + options.PVC.Namespace, nil
+	} else {
+		return options.PVC.Name + "-" + options.PVName, nil
+	}
+
 }
 
 // Delete removes the storage asset that was created by Provision represented
@@ -248,6 +375,8 @@ func (p *efsProvisioner) Delete(volume *v1.PersistentVolume) error {
 	if err != nil {
 		return err
 	}
+
+	glog.Infof("Deleting %s", path)
 
 	if err := os.RemoveAll(path); err != nil {
 		return err
@@ -271,13 +400,30 @@ func (p *efsProvisioner) getLocalPathToDelete(nfs *v1.NFSVolumeSource) (string, 
 	return path.Join(p.mountpoint, subpath), nil
 }
 
+// buildKubeConfig builds REST config based on master URL and kubeconfig path.
+// If both of them are empty then in cluster config is used.
+func buildKubeConfig() (*rest.Config, error) {
+	kubeconfig := os.Getenv("KUBECONFIG_PATH")
+	master := os.Getenv("KUBE_MASTER_URL")
+
+	if master != "" || kubeconfig != "" {
+		glog.Infof("Either master or kubeconfig specified. building kube config from that..")
+		return clientcmd.BuildConfigFromFlags(master, kubeconfig)
+	} else {
+		glog.Infof("Building kube configs for running in cluster...")
+		return rest.InClusterConfig()
+	}
+}
+
 func main() {
 	flag.Parse()
 	flag.Set("logtostderr", "true")
 
+	glog.Info("Starting efs-provisioner")
+
 	// Create an InClusterConfig and use it to create a client for the controller
 	// to use to communicate with Kubernetes
-	config, err := rest.InClusterConfig()
+	config, err := buildKubeConfig()
 	if err != nil {
 		glog.Fatalf("Failed to create config: %v", err)
 	}
@@ -310,6 +456,8 @@ func main() {
 		efsProvisioner,
 		serverVersion.GitVersion,
 	)
+
+	glog.Info("Starting provisioner controller")
 
 	pc.Run(wait.NeverStop)
 }

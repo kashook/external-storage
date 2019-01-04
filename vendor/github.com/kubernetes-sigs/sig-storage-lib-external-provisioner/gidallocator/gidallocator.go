@@ -25,6 +25,7 @@ import (
 
 	"github.com/golang/glog"
 	"github.com/kubernetes-sigs/sig-storage-lib-external-provisioner/allocator"
+	"github.com/kubernetes-sigs/sig-storage-lib-external-provisioner/gidreclaimer"
 	"github.com/kubernetes-sigs/sig-storage-lib-external-provisioner/controller"
 	"github.com/kubernetes-sigs/sig-storage-lib-external-provisioner/util"
 	"k8s.io/api/core/v1"
@@ -53,6 +54,7 @@ type Allocator struct {
 	client       kubernetes.Interface
 	gidTable     map[string]*allocator.MinMaxAllocator
 	gidTableLock sync.Mutex
+	gidReclaimer gidreclaimer.GIDReclaimer
 }
 
 // New creates a new GID Allocator
@@ -61,6 +63,12 @@ func New(client kubernetes.Interface) Allocator {
 		client:   client,
 		gidTable: make(map[string]*allocator.MinMaxAllocator),
 	}
+}
+
+func NewWithGIDReclaimer(client kubernetes.Interface, reclaimer gidreclaimer.GIDReclaimer) Allocator {
+	a := New(client)
+	a.gidReclaimer = reclaimer
+	return a
 }
 
 // AllocateNext allocates the next available GID for the given VolumeOptions
@@ -208,6 +216,17 @@ func (a *Allocator) collectGids(className string, gidTable *allocator.MinMaxAllo
 			glog.Errorf("failed to store gid %v found in pv '%v': %v", gid, pvName, err)
 			return err
 		}
+	}
+
+	// if a gid reclaimer was given, call it to allow it to contribute additional GIDs to the gidtable
+	if a.gidReclaimer != nil {
+		glog.Info("Calling GID reclaimer")
+		if err := a.gidReclaimer.Reclaim(className, gidTable); err != nil {
+			glog.Errorf("GID reclaimer failed: %v", err)
+			return err
+		}
+	} else {
+		glog.Info("No GID reclaimer was given, skipping")
 	}
 
 	return nil
